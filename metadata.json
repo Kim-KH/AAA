@@ -1,0 +1,5 @@
+{
+  "name": "StrideTrack",
+  "description": "A comprehensive running tracker with GPS distance, time, step estimation, audio alerts, and detailed statistics (daily, weekly, monthly, yearly).",
+  "requestFramePermissions": ["geolocation"]
+}
