@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   Play, Square, History, Settings as SettingsIcon, TrendingUp, 
-  MapPin, Timer, Footprints, Volume2, VolumeX, ChevronLeft, Calendar 
+  MapPin, Timer, Volume2, VolumeX, ChevronLeft, Calendar, Trash2, Zap
 } from 'lucide-react';
 import { 
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, 
@@ -13,71 +13,74 @@ import {
   subDays, startOfMonth, endOfMonth, startOfYear, endOfYear 
 } from 'date-fns';
 
-// --- [의존성 해결] 외부 파일(cn) 없이 작동하도록 내장 ---
+// --- [Utility] 외부 파일 의존성 해결용 ---
 function cn(...inputs: any[]) {
   return inputs.filter(Boolean).join(' ');
 }
 
-// --- Types (원본과 동일) ---
+// --- Types (Steps 제거됨) ---
 interface Run {
   id: number;
-  distance: number; 
-  duration: number; 
-  steps: number;
+  distance: number; // meters
+  duration: number; // seconds
   timestamp: string;
 }
 
 interface Stats {
-  daily: { date: string; distance: number; steps: number }[];
-  weekly: { week: string; distance: number; steps: number }[];
-  monthly: { month: string; distance: number; steps: number }[];
-  yearly: { year: string; distance: number; steps: number }[];
+  daily: { date: string; distance: number }[];
+  weekly: { week: string; distance: number }[];
+  monthly: { month: string; distance: number }[];
 }
 
 type View = 'dashboard' | 'active-run' | 'history' | 'stats' | 'settings';
 
-const ALERT_INTERVALS = [500, 1000, 2000, 3000, 4000, 5000, 10000];
+// [수정] 시간 단위 알림 설정값 (초 단위로 관리: 5분=300초, 10분=600초 등)
+const TIME_ALERTS = [
+  { label: '5분', value: 300 },
+  { label: '10분', value: 600 },
+  { label: '15분', value: 900 },
+  { label: '20분', value: 1200 },
+  { label: '25분', value: 1500 },
+  { label: '30분', value: 1800 },
+  { label: '60분', value: 3600 },
+];
 
 export default function App() {
   const [view, setView] = useState<View>('dashboard');
   const [isTracking, setIsTracking] = useState(false);
   const [distance, setDistance] = useState(0); 
   const [duration, setDuration] = useState(0); 
-  const [steps, setSteps] = useState(0);
-  const [lastAlertDistance, setLastAlertDistance] = useState(0);
+  const [lastAlertTime, setLastAlertTime] = useState(0); // 시간 알림 추적용
   const [runs, setRuns] = useState<Run[]>([]);
-  // 하얀 화면 방지를 위해 초기값을 null이 아닌 기본 객체로 설정
-  const [stats, setStats] = useState<Stats>({ daily: [], weekly: [], monthly: [], yearly: [] });
+  const [stats, setStats] = useState<Stats>({ daily: [], weekly: [], monthly: [] });
   const [gpsStatus, setGpsStatus] = useState<'searching' | 'active' | 'error'>('searching');
   const [gpsAccuracy, setGpsAccuracy] = useState<number | null>(null);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   
   const [audioEnabled, setAudioEnabled] = useState(true);
-  const [alertInterval, setAlertInterval] = useState(1000); 
-  const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
-  const wakeLock = useRef<any>(null);
+  const [alertInterval, setAlertInterval] = useState(300); // 기본 5분 알림
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   const watchId = useRef<number | null>(null);
   const lastPosition = useRef<GeolocationCoordinates | null>(null);
+  const startTimeRef = useRef<number | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
-  const lastStepTime = useRef<number>(0);
 
-  // --- [Data Logic] 로컬 데이터 처리 (서버 연산 로직 완벽 이식) ---
+  // --- [Data Logic] 로컬 데이터 처리 및 통계 계산 ---
 
   const calculateStatsLocally = (allRuns: Run[]) => {
     const now = new Date();
     
+    // 일간 통계
     const daily = Array.from({ length: 7 }).map((_, i) => {
       const d = subDays(now, i);
       const dayRuns = allRuns.filter(r => isSameDay(new Date(r.timestamp), d));
       return {
         date: format(d, 'yyyy-MM-dd'),
-        distance: dayRuns.reduce((sum, r) => sum + r.distance, 0),
-        steps: dayRuns.reduce((sum, r) => sum + r.steps, 0)
+        distance: dayRuns.reduce((sum, r) => sum + r.distance, 0)
       };
     });
 
+    // 주간 통계
     const weekly = Array.from({ length: 4 }).map((_, i) => {
       const d = subDays(now, i * 7);
       const weekRuns = allRuns.filter(r => {
@@ -86,11 +89,11 @@ export default function App() {
       });
       return {
         week: `${format(startOfWeek(d), 'MM/dd')}`,
-        distance: weekRuns.reduce((sum, r) => sum + r.distance, 0),
-        steps: weekRuns.reduce((sum, r) => sum + r.steps, 0)
+        distance: weekRuns.reduce((sum, r) => sum + r.distance, 0)
       };
     });
 
+    // 월간 통계
     const monthly = Array.from({ length: 6 }).map((_, i) => {
       const d = startOfMonth(subDays(now, i * 30));
       const monthRuns = allRuns.filter(r => {
@@ -99,23 +102,22 @@ export default function App() {
       });
       return {
         month: format(d, 'MMM'),
-        distance: monthRuns.reduce((sum, r) => sum + r.distance, 0),
-        steps: monthRuns.reduce((sum, r) => sum + r.steps, 0)
+        distance: monthRuns.reduce((sum, r) => sum + r.distance, 0)
       };
     });
 
-    setStats({ daily, weekly, monthly, yearly: [] });
+    setStats({ daily, weekly, monthly });
   };
 
   const fetchRuns = async () => {
-    const saved = localStorage.getItem('stridetrack_runs');
+    const saved = localStorage.getItem('stridetrack_v3_runs');
     const allRuns = saved ? JSON.parse(saved) : [];
     setRuns(allRuns);
     return allRuns;
   };
 
   const fetchStats = async () => {
-    const saved = localStorage.getItem('stridetrack_runs');
+    const saved = localStorage.getItem('stridetrack_v3_runs');
     const allRuns = saved ? JSON.parse(saved) : [];
     calculateStatsLocally(allRuns);
   };
@@ -125,57 +127,39 @@ export default function App() {
       id: Date.now(),
       distance,
       duration,
-      steps,
       timestamp: new Date().toISOString(),
     };
     const updatedRuns = [newRun, ...runs];
     setRuns(updatedRuns);
-    localStorage.setItem('stridetrack_runs', JSON.stringify(updatedRuns));
+    localStorage.setItem('stridetrack_v3_runs', JSON.stringify(updatedRuns));
     calculateStatsLocally(updatedRuns);
   };
 
-  // --- [원본 로직] GPS, Motion, Audio 루프 ---
+  const deleteRun = async (id: number) => {
+    if (!confirm("이 기록을 삭제하시겠습니까?")) return;
+    const updatedRuns = runs.filter(r => r.id !== id);
+    setRuns(updatedRuns);
+    localStorage.setItem('stridetrack_v3_runs', JSON.stringify(updatedRuns));
+    calculateStatsLocally(updatedRuns);
+  };
+
+  // --- [Logic] GPS, Audio 트래킹 루프 ---
 
   useEffect(() => {
     fetchRuns();
     fetchStats();
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('/sw.js').catch(() => {});
-    }
-    window.addEventListener('beforeinstallprompt', (e) => {
-      e.preventDefault();
-      setDeferredPrompt(e);
-    });
-    if (typeof (DeviceMotionEvent as any)?.requestPermission === 'function') {
-      (DeviceMotionEvent as any).requestPermission();
-    }
   }, []);
 
   useEffect(() => {
     if (isTracking) {
       startTracking();
-      window.addEventListener('devicemotion', handleMotion);
     } else {
       stopTracking();
-      window.removeEventListener('devicemotion', handleMotion);
     }
     return () => {
       stopTracking();
-      window.removeEventListener('devicemotion', handleMotion);
     };
   }, [isTracking]);
-
-  const handleMotion = (event: DeviceMotionEvent) => {
-    const acc = event.accelerationIncludingGravity;
-    if (!acc) return;
-    const totalAcc = Math.sqrt((acc.x || 0)**2 + (acc.y || 0)**2 + (acc.z || 0)**2);
-    const now = Date.now();
-    if (totalAcc > 13 && now - lastStepTime.current > 300) {
-      setSteps(prev => prev + 1);
-      lastStepTime.current = now;
-      if (gpsAccuracy && gpsAccuracy > 20) setDistance(prev => prev + 0.7);
-    }
-  };
 
   const startSilentAudio = () => {
     if (!audioRef.current) {
@@ -192,10 +176,18 @@ export default function App() {
 
   const startTracking = () => {
     startSilentAudio();
-    setDistance(0); setDuration(0); setSteps(0); setLastAlertDistance(0);
+    setDistance(0); setDuration(0); setLastAlertTime(0);
     setGpsStatus('searching');
     lastPosition.current = null;
-    timerRef.current = setInterval(() => setDuration(prev => prev + 1), 1000);
+    startTimeRef.current = Date.now();
+
+    // 시스템 시각 기반 정밀 타이머
+    timerRef.current = setInterval(() => {
+      if (startTimeRef.current) {
+        const elapsed = Math.floor((Date.now() - startTimeRef.current) / 1000);
+        setDuration(elapsed);
+      }
+    }, 500);
 
     if ("geolocation" in navigator) {
       watchId.current = navigator.geolocation.watchPosition(
@@ -204,7 +196,8 @@ export default function App() {
           setGpsAccuracy(pos.coords.accuracy);
           if (lastPosition.current) {
             const d = calculateDistance(lastPosition.current.latitude, lastPosition.current.longitude, pos.coords.latitude, pos.coords.longitude);
-            if (d > 1 && pos.coords.accuracy < 50) setDistance(prev => prev + d);
+            // 2m 이상 이동 & 정확도 40m 이내일 때만 거리 인정
+            if (d > 2 && pos.coords.accuracy < 40) setDistance(prev => prev + d);
           }
           lastPosition.current = pos.coords;
         },
@@ -219,6 +212,7 @@ export default function App() {
     if (watchId.current) navigator.geolocation.clearWatch(watchId.current);
     if (timerRef.current) clearInterval(timerRef.current);
     watchId.current = null; timerRef.current = null;
+    startTimeRef.current = null;
   };
 
   const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
@@ -233,64 +227,86 @@ export default function App() {
     const h = Math.floor(s / 3600);
     const m = Math.floor((s % 3600) / 60);
     const sec = s % 60;
-    return [h, m, sec].map(v => v.toString().padStart(2, '0')).join(':');
+    if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
+    return `${m}:${sec.toString().padStart(2, '0')}`;
   };
 
-  const playAlert = (dist: number) => {
-    if (!audioEnabled) return;
-    const utterance = new SpeechSynthesisUtterance(`${(dist / 1000).toFixed(1)} kilometers reached.`);
-    window.speechSynthesis.speak(utterance);
-  };
-
+  // [수정] 시간 단위 음성 알림 로직
   useEffect(() => {
     if (isTracking && audioEnabled) {
-      const diff = distance - lastAlertDistance;
-      if (diff >= alertInterval) {
-        playAlert(distance);
-        setLastAlertDistance(Math.floor(distance / alertInterval) * alertInterval);
+      // 지정된 간격(alertInterval)마다 한 번씩 알림
+      if (duration > 0 && duration % alertInterval === 0 && duration !== lastAlertTime) {
+        const mins = duration / 60;
+        const distKm = (distance / 1000).toFixed(2);
+        const utterance = new SpeechSynthesisUtterance(`${mins}분 경과했습니다. 현재 이동 거리는 ${distKm} 킬로미터입니다.`);
+        window.speechSynthesis.speak(utterance);
+        setLastAlertTime(duration);
       }
     }
-  }, [distance, isTracking, audioEnabled, alertInterval, lastAlertDistance]);
+  }, [duration, isTracking, audioEnabled, alertInterval, lastAlertTime, distance]);
 
-  // --- [원본 UI 완벽 복원] 렌더링 함수들 ---
+  // 페이스 계산 (분.초 / 1km 형식)
+  const calculatePace = (distM: number, timeS: number) => {
+    if (distM < 10) return "0.00";
+    const paceDecimal = (timeS / 60) / (distM / 1000);
+    const mins = Math.floor(paceDecimal);
+    const secs = Math.round((paceDecimal - mins) * 60);
+    return `${mins}.${secs.toString().padStart(2, '0')}`;
+  };
+
+  // --- [UI Render] ---
 
   const renderDashboard = () => (
     <div className="p-6 space-y-8">
       <div className="flex justify-between items-center">
-        <div><h1 className="text-3xl font-bold text-slate-900">StrideTrack</h1><p className="text-slate-500">Ready for a run?</p></div>
-        <button onClick={() => setView('settings')} className="p-2 rounded-full bg-slate-100 text-slate-600"><SettingsIcon size={24} /></button>
+        <div>
+          <h1 className="text-3xl font-black text-slate-900 tracking-tight">StrideTrack</h1>
+          <p className="text-slate-500 font-medium italic text-sm">Ready for a better run?</p>
+        </div>
+        <button onClick={() => setView('settings')} className="p-3 rounded-full bg-slate-100 text-slate-600 shadow-sm"><SettingsIcon size={24} /></button>
       </div>
 
       <div className="grid grid-cols-2 gap-4">
-        <div className="bg-emerald-50 p-4 rounded-2xl border border-emerald-100">
-          <div className="flex items-center gap-2 text-emerald-600 mb-1"><TrendingUp size={16} /><span className="text-xs font-semibold uppercase tracking-wider">Today</span></div>
-          <p className="text-2xl font-bold text-slate-900">{((stats.daily[0]?.distance || 0) / 1000).toFixed(2)} <span className="text-sm font-normal text-slate-500">km</span></p>
+        <div className="bg-emerald-500 p-5 rounded-3xl text-white shadow-lg shadow-emerald-100 flex flex-col justify-between h-32">
+          <div className="flex items-center gap-2 mb-2 opacity-90"><TrendingUp size={16} /><span className="text-xs font-bold uppercase tracking-widest">Today</span></div>
+          <p className="text-3xl font-black">{((stats.daily[0]?.distance || 0) / 1000).toFixed(2)} <span className="text-sm font-medium">km</span></p>
         </div>
-        <div className="bg-indigo-50 p-4 rounded-2xl border border-indigo-100">
-          <div className="flex items-center gap-2 text-indigo-600 mb-1"><Footprints size={16} /><span className="text-xs font-semibold uppercase tracking-wider">Steps</span></div>
-          <p className="text-2xl font-bold text-slate-900">{stats.daily[0]?.steps || 0}</p>
+        <div className="bg-white p-5 rounded-3xl border border-slate-100 shadow-sm flex flex-col justify-between h-32">
+          <div className="flex items-center gap-2 mb-2 text-emerald-500"><Zap size={16} /><span className="text-xs font-bold uppercase tracking-widest">Avg Pace</span></div>
+          <p className="text-2xl font-black text-slate-900">
+            {runs.length > 0 ? calculatePace(runs[0].distance, runs[0].duration) : "0.00"}
+            <span className="text-xs font-normal text-slate-400 ml-1">분/km</span>
+          </p>
         </div>
       </div>
 
-      <div className="flex flex-col items-center justify-center py-12">
-        <motion.button whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} onClick={() => { setIsTracking(true); setView('active-run'); }} className="w-40 h-40 rounded-full bg-emerald-500 shadow-xl flex flex-col items-center justify-center text-white gap-2">
-          <Play size={48} fill="currentColor" /><span className="font-bold text-lg">START</span>
+      <div className="flex flex-col items-center justify-center py-10">
+        <motion.button 
+          whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} 
+          onClick={() => { setIsTracking(true); setView('active-run'); }} 
+          className="w-44 h-44 rounded-full bg-emerald-500 shadow-2xl flex flex-col items-center justify-center text-white gap-2 border-8 border-emerald-50"
+        >
+          <Play size={54} fill="currentColor" />
+          <span className="font-black text-xl tracking-tighter">START</span>
         </motion.button>
       </div>
 
       <div className="space-y-4">
-        <div className="flex justify-between items-center"><h2 className="text-lg font-bold text-slate-900">Recent Runs</h2><button onClick={() => setView('history')} className="text-sm text-emerald-600 font-semibold">View All</button></div>
+        <div className="flex justify-between items-end"><h2 className="text-xl font-black text-slate-900">Recent Runs</h2><button onClick={() => setView('history')} className="text-sm font-bold text-emerald-600">View All</button></div>
         <div className="space-y-3">
           {runs.slice(0, 3).map(run => (
-            <div key={run.id} className="bg-white p-4 rounded-xl border border-slate-100 flex justify-between items-center shadow-sm">
+            <div key={run.id} className="bg-white p-4 rounded-2xl border border-slate-50 flex justify-between items-center shadow-sm">
               <div className="flex items-center gap-4">
-                <div className="w-10 h-10 rounded-lg bg-slate-50 flex items-center justify-center text-slate-400"><MapPin size={20} /></div>
-                <div><p className="font-bold text-slate-900">{(run.distance / 1000).toFixed(2)} km</p><p className="text-xs text-slate-500">{format(new Date(run.timestamp), 'MMM d, h:mm a')}</p></div>
+                <div className="w-12 h-12 rounded-2xl bg-slate-50 flex items-center justify-center text-slate-400"><MapPin size={24} /></div>
+                <div><p className="font-black text-slate-900">{(run.distance / 1000).toFixed(2)} km</p><p className="text-xs font-medium text-slate-400">{format(new Date(run.timestamp), 'MMM d, HH:mm')}</p></div>
               </div>
-              <div className="text-right"><p className="text-sm font-medium text-slate-700">{formatTime(run.duration)}</p><p className="text-xs text-slate-400">{run.steps} steps</p></div>
+              <div className="text-right">
+                <p className="text-sm font-bold text-emerald-600">{calculatePace(run.distance, run.duration)}분/km</p>
+                <p className="text-xs font-medium text-slate-400">{formatTime(run.duration)}</p>
+              </div>
             </div>
           ))}
-          {runs.length === 0 && <p className="text-center text-slate-400 py-4">No runs yet.</p>}
+          {runs.length === 0 && <p className="text-center text-slate-400 py-10">No runs yet. Start your first one!</p>}
         </div>
       </div>
     </div>
@@ -298,40 +314,58 @@ export default function App() {
 
   const renderActiveRun = () => (
     <div className="h-full flex flex-col bg-slate-900 text-white p-8">
-      <div className="flex justify-between items-center mb-4">
-        <div className="flex items-center gap-2">
+      <div className="flex justify-between items-center mb-6">
+        <div className="flex items-center gap-2 px-3 py-1 bg-white/10 rounded-full">
           <div className={cn("w-2 h-2 rounded-full animate-pulse", gpsStatus === 'active' ? "bg-emerald-500" : "bg-amber-500")} />
-          <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">{gpsStatus === 'active' ? `GPS Active (${gpsAccuracy?.toFixed(0)}m)` : 'Searching...'}</span>
+          <span className="text-[10px] font-black uppercase tracking-widest">{gpsStatus === 'active' ? `GPS ON (${gpsAccuracy?.toFixed(0)}m)` : 'Searching GPS...'}</span>
         </div>
       </div>
-      <div className="flex-1 flex flex-col items-center justify-center space-y-12">
-        <div className="text-center"><p className="text-slate-400 font-medium uppercase tracking-widest text-sm mb-2">Distance</p><h2 className="text-8xl font-black tracking-tighter">{(distance / 1000).toFixed(2)}</h2><p className="text-2xl font-bold text-emerald-400">KILOMETERS</p></div>
-        <div className="grid grid-cols-2 w-full gap-8">
-          <div className="text-center"><Timer size={18} className="mx-auto mb-1 text-slate-400" /><p className="text-3xl font-bold">{formatTime(duration)}</p></div>
-          <div className="text-center"><Footprints size={18} className="mx-auto mb-1 text-slate-400" /><p className="text-3xl font-bold">{steps}</p></div>
+      
+      <div className="flex-1 flex flex-col items-center justify-center space-y-16">
+        <div className="text-center">
+          <p className="text-slate-500 font-bold uppercase tracking-[0.3em] text-sm mb-4">Distance</p>
+          <h2 className="text-[9rem] font-black tracking-tighter leading-none">{(distance / 1000).toFixed(2)}</h2>
+          <p className="text-3xl font-black text-emerald-400 mt-4">KM</p>
+        </div>
+
+        <div className="grid grid-cols-2 w-full gap-12">
+          <div className="text-center border-r border-white/10">
+            <div className="flex items-center justify-center gap-2 text-slate-500 mb-2"><Timer size={18} /><span className="text-xs font-bold uppercase tracking-widest">Time</span></div>
+            <p className="text-4xl font-black">{formatTime(duration)}</p>
+          </div>
+          <div className="text-center">
+            <div className="flex items-center justify-center gap-2 text-slate-500 mb-2"><Zap size={18} /><span className="text-xs font-bold uppercase tracking-widest">Pace</span></div>
+            <p className="text-4xl font-black text-emerald-400">{calculatePace(distance, duration)}</p>
+          </div>
         </div>
       </div>
-      <div className="flex gap-4 pb-8">
-        <button onClick={() => setAudioEnabled(!audioEnabled)} className={cn("p-4 rounded-2xl", audioEnabled ? "bg-emerald-500/20 text-emerald-400" : "bg-slate-800 text-slate-500")}><Volume2 size={24} /></button>
-        <button onClick={() => { saveRun(); setIsTracking(false); setView('dashboard'); }} className="flex-1 bg-rose-500 font-bold py-4 rounded-2xl flex items-center justify-center gap-2">FINISH RUN</button>
+
+      <div className="flex gap-4 pb-10">
+        <button onClick={() => setAudioEnabled(!audioEnabled)} className={cn("p-5 rounded-3xl transition-all", audioEnabled ? "bg-emerald-500/20 text-emerald-400" : "bg-slate-800 text-slate-500")}><Volume2 size={28} /></button>
+        <button onClick={() => { saveRun(); stopTracking(); setIsTracking(false); setView('dashboard'); }} className="flex-1 bg-rose-500 hover:bg-rose-600 text-white font-black py-5 rounded-3xl text-xl shadow-2xl active:scale-95 transition-transform">FINISH RUN</button>
       </div>
     </div>
   );
 
   const renderHistory = () => (
-    <div className="p-6 space-y-6">
-      <div className="flex items-center gap-4"><button onClick={() => setView('dashboard')} className="p-2 rounded-lg bg-slate-100 text-slate-600"><ChevronLeft size={20} /></button><h1 className="text-2xl font-bold text-slate-900">Run History</h1></div>
+    <div className="p-6 space-y-6 pb-24 h-full overflow-y-auto">
+      <div className="flex items-center gap-4">
+        <button onClick={() => setView('dashboard')} className="p-2 rounded-xl bg-slate-100 text-slate-600"><ChevronLeft size={24} /></button>
+        <h1 className="text-3xl font-black text-slate-900 tracking-tight">History</h1>
+      </div>
       <div className="space-y-4">
         {runs.map(run => (
-          <div key={run.id} className="bg-white p-5 rounded-2xl border border-slate-100 shadow-sm space-y-4">
+          <div key={run.id} className="bg-white p-6 rounded-[2.5rem] border border-slate-100 shadow-sm space-y-4">
             <div className="flex justify-between items-start">
-              <div><p className="text-sm text-slate-500">{format(new Date(run.timestamp), 'EEEE, MMMM d')}</p><p className="text-xs text-slate-400">{format(new Date(run.timestamp), 'h:mm a')}</p></div>
-              <div className="bg-emerald-50 text-emerald-600 px-3 py-1 rounded-full text-xs font-bold">Completed</div>
+              <div>
+                <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-1">{format(new Date(run.timestamp), 'EEEE, MMMM d')}</p>
+                <h3 className="text-3xl font-black text-slate-900">{(run.distance / 1000).toFixed(2)} km</h3>
+              </div>
+              <button onClick={() => deleteRun(run.id)} className="p-2 text-slate-300 hover:text-rose-500 transition-colors"><Trash2 size={20} /></button>
             </div>
-            <div className="grid grid-cols-3 gap-4 border-t border-slate-50 pt-4 text-center">
-              <div><p className="text-xs text-slate-400 font-bold uppercase mb-1">Dist</p><p className="font-bold text-slate-900">{(run.distance / 1000).toFixed(2)}km</p></div>
-              <div><p className="text-xs text-slate-400 font-bold uppercase mb-1">Time</p><p className="font-bold text-slate-900">{formatTime(run.duration)}</p></div>
-              <div><p className="text-xs text-slate-400 font-bold uppercase mb-1">Steps</p><p className="font-bold text-slate-900">{run.steps}</p></div>
+            <div className="grid grid-cols-2 gap-4 border-t border-slate-50 pt-4 text-center">
+              <div><p className="text-[10px] font-bold text-slate-400 uppercase mb-1">Duration</p><p className="font-black text-slate-700 text-sm">{formatTime(run.duration)}</p></div>
+              <div><p className="text-[10px] font-bold text-slate-400 uppercase mb-1">Avg Pace</p><p className="font-black text-emerald-600 text-sm">{calculatePace(run.distance, run.duration)} 분/km</p></div>
             </div>
           </div>
         ))}
@@ -344,57 +378,66 @@ export default function App() {
     const chartData = statTab === 'day' ? stats.daily : statTab === 'week' ? stats.weekly : stats.monthly;
     const formattedData = chartData.map(d => ({
       name: (d as any).date ? format(new Date((d as any).date), 'dd') : (d as any).week || (d as any).month,
-      distance: Number(((d.distance || 0) / 1000).toFixed(2)),
-      steps: d.steps || 0
+      distance: Number(((d.distance || 0) / 1000).toFixed(2))
     })).reverse();
 
     return (
-      <div className="p-6 space-y-6 pb-24">
-        <div className="flex items-center gap-4"><button onClick={() => setView('dashboard')} className="p-2 rounded-lg bg-slate-100"><ChevronLeft size={20} /></button><h1 className="text-2xl font-bold">Statistics</h1></div>
-        <div className="flex p-1 bg-slate-100 rounded-xl">
+      <div className="p-6 space-y-6 pb-24 h-full overflow-y-auto">
+        <div className="flex items-center gap-4"><button onClick={() => setView('dashboard')} className="p-2 rounded-xl bg-slate-100 text-slate-600"><ChevronLeft size={24} /></button><h1 className="text-3xl font-black text-slate-900 tracking-tight">Stats</h1></div>
+        <div className="flex p-1.5 bg-slate-100 rounded-2xl">
           {['day', 'week', 'month'].map(tab => (
-            <button key={tab} onClick={() => setStatTab(tab as any)} className={cn("flex-1 py-2 text-xs font-bold rounded-lg capitalize", statTab === tab ? "bg-white text-emerald-600 shadow-sm" : "text-slate-500")}>{tab}</button>
+            <button key={tab} onClick={() => setStatTab(tab as any)} className={cn("flex-1 py-2.5 text-xs font-black rounded-xl capitalize transition-all", statTab === tab ? "bg-white text-emerald-600 shadow-sm" : "text-slate-500")}>{tab}</button>
           ))}
         </div>
-        <div className="bg-white p-4 rounded-2xl border shadow-sm">
-          <h3 className="text-sm font-bold text-slate-900 mb-6">Distance (km)</h3>
-          <div className="h-64 w-full"><ResponsiveContainer><BarChart data={formattedData}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="name" tick={{fontSize: 10}} /><YAxis tick={{fontSize: 10}} /><Tooltip /><Bar dataKey="distance" fill="#10b981" radius={[4, 4, 0, 0]} /></BarChart></ResponsiveContainer></div>
-        </div>
-        <div className="bg-white p-4 rounded-2xl border shadow-sm">
-          <h3 className="text-sm font-bold text-slate-900 mb-6">Steps</h3>
-          <div className="h-64 w-full"><ResponsiveContainer><LineChart data={formattedData}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="name" tick={{fontSize: 10}} /><YAxis tick={{fontSize: 10}} /><Tooltip /><Line type="monotone" dataKey="steps" stroke="#6366f1" strokeWidth={3} dot={{r: 4}} /></LineChart></ResponsiveContainer></div>
+        <div className="bg-white p-6 rounded-[2.5rem] border border-slate-100 shadow-sm">
+          <h3 className="text-sm font-black text-slate-900 flex items-center gap-2 mb-6"><TrendingUp size={18} className="text-emerald-500" /> Distance (km)</h3>
+          <div className="h-64 w-full">
+            <ResponsiveContainer>
+              <BarChart data={formattedData}>
+                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
+                <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{fontSize: 10, fontWeight: 700, fill: '#94a3b8'}} />
+                <Tooltip cursor={{fill: '#f8fafc'}} contentStyle={{borderRadius: '20px', border: 'none', boxShadow: '0 10px 25px -5px rgba(0,0,0,0.1)'}} />
+                <Bar dataKey="distance" fill="#10b981" radius={[8, 8, 0, 0]} barSize={24} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
         </div>
       </div>
     );
   };
 
   const renderSettings = () => (
-    <div className="p-6 space-y-8">
-      <div className="flex items-center gap-4"><button onClick={() => setView('dashboard')} className="p-2 rounded-lg bg-slate-100 text-slate-600"><ChevronLeft size={20} /></button><h1 className="text-2xl font-bold text-slate-900">Settings</h1></div>
+    <div className="p-6 space-y-8 h-full overflow-y-auto">
+      <div className="flex items-center gap-4">
+        <button onClick={() => setView('dashboard')} className="p-2 rounded-xl bg-slate-100 text-slate-600"><ChevronLeft size={24} /></button>
+        <h1 className="text-3xl font-black text-slate-900 tracking-tight">Settings</h1>
+      </div>
       <div className="space-y-6">
-        <div className="bg-white p-6 rounded-2xl border border-slate-100 shadow-sm space-y-6">
+        <div className="bg-white p-6 rounded-[2.5rem] border border-slate-100 shadow-sm space-y-8">
           <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className={cn("p-2 rounded-lg", audioEnabled ? "bg-emerald-50 text-emerald-600" : "bg-slate-50 text-slate-400")}><Volume2 size={20} /></div>
-              <div><p className="font-bold text-slate-900">Audio Alerts</p><p className="text-xs text-slate-500">Voice feedback during run</p></div>
+            <div className="flex items-center gap-4">
+              <div className={cn("p-3 rounded-2xl", audioEnabled ? "bg-emerald-50 text-emerald-600" : "bg-slate-50 text-slate-400")}><Volume2 size={24} /></div>
+              <div><p className="font-black text-slate-900">Voice Alerts</p><p className="text-xs font-medium text-slate-500">Audio feedback by time</p></div>
             </div>
-            <button onClick={() => setAudioEnabled(!audioEnabled)} className={cn("w-12 h-6 rounded-full transition-colors relative", audioEnabled ? "bg-emerald-500" : "bg-slate-200")}><div className={cn("absolute top-1 w-4 h-4 bg-white rounded-full transition-all", audioEnabled ? "left-7" : "left-1")} /></button>
+            <button onClick={() => setAudioEnabled(!audioEnabled)} className={cn("w-14 h-8 rounded-full transition-all relative shadow-inner", audioEnabled ? "bg-emerald-500" : "bg-slate-200")}><div className={cn("absolute top-1 w-6 h-6 bg-white rounded-full transition-all shadow-sm", audioEnabled ? "left-7" : "left-1")} /></button>
           </div>
-        </div>
-        <div className="bg-white p-6 rounded-2xl border border-slate-100 shadow-sm">
-          <p className="text-sm font-bold text-slate-900 mb-4">Installation</p>
-          {deferredPrompt ? (
-            <button onClick={() => deferredPrompt.prompt()} className="w-full bg-emerald-600 text-white font-bold py-3 rounded-xl flex items-center justify-center gap-2 shadow-lg shadow-emerald-200"><Play size={18} fill="currentColor" />Install StrideTrack App</button>
-          ) : <p className="text-xs text-slate-400">Ready or already installed.</p>}
+          <div className="space-y-4">
+            <p className="text-sm font-black text-slate-900 tracking-tight">Voice Interval (Minutes)</p>
+            <div className="grid grid-cols-3 gap-2">
+              {TIME_ALERTS.map(item => (
+                <button key={item.value} onClick={() => setAlertInterval(item.value)} className={cn("py-3 rounded-2xl text-xs font-black transition-all border-2", alertInterval === item.value ? "bg-emerald-50 border-emerald-500 text-emerald-600 scale-[1.05]" : "bg-white border-slate-50 text-slate-400")}>{item.label}</button>
+              ))}
+            </div>
+          </div>
         </div>
       </div>
     </div>
   );
 
   return (
-    <div className="max-w-md mx-auto h-screen bg-slate-50 overflow-y-auto font-sans relative">
+    <div className="max-w-md mx-auto h-screen bg-slate-50 overflow-hidden font-sans relative">
       <AnimatePresence mode="wait">
-        <motion.div key={view} initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} transition={{ duration: 0.2 }} className="h-full">
+        <motion.div key={view} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.25 }} className="h-full">
           {view === 'dashboard' && renderDashboard()}
           {view === 'active-run' && renderActiveRun()}
           {view === 'history' && renderHistory()}
@@ -404,11 +447,11 @@ export default function App() {
       </AnimatePresence>
 
       {view !== 'active-run' && (
-        <div className="fixed bottom-0 left-0 right-0 max-w-md mx-auto bg-white/80 backdrop-blur-md border-t border-slate-100 px-6 py-3 flex justify-between items-center">
-          <button onClick={() => setView('dashboard')} className={cn("p-2 flex flex-col items-center gap-1", view === 'dashboard' ? "text-emerald-600" : "text-slate-400")}><Play size={20} fill={view === 'dashboard' ? "currentColor" : "none"} /><span className="text-[10px] font-bold uppercase tracking-widest">Run</span></button>
-          <button onClick={() => setView('stats')} className={cn("p-2 flex flex-col items-center gap-1", view === 'stats' ? "text-emerald-600" : "text-slate-400")}><TrendingUp size={20} /><span className="text-[10px] font-bold uppercase tracking-widest">Stats</span></button>
-          <button onClick={() => setView('history')} className={cn("p-2 flex flex-col items-center gap-1", view === 'history' ? "text-emerald-600" : "text-slate-400")}><History size={20} /><span className="text-[10px] font-bold uppercase tracking-widest">History</span></button>
-          <button onClick={() => setView('settings')} className={cn("p-2 flex flex-col items-center gap-1", view === 'settings' ? "text-emerald-600" : "text-slate-400")}><SettingsIcon size={20} /><span className="text-[10px] font-bold uppercase tracking-widest">Settings</span></button>
+        <div className="fixed bottom-0 left-0 right-0 max-w-md mx-auto bg-white/90 backdrop-blur-xl border-t border-slate-100 px-8 py-4 flex justify-between items-center z-50">
+          <button onClick={() => setView('dashboard')} className={cn("p-2 flex flex-col items-center gap-1 transition-all", view === 'dashboard' ? "text-emerald-600 scale-110" : "text-slate-300")}><Play size={20} fill={view === 'dashboard' ? "currentColor" : "none"} /><span className="text-[10px] font-bold uppercase tracking-widest">Run</span></button>
+          <button onClick={() => setView('stats')} className={cn("p-2 flex flex-col items-center gap-1 transition-all", view === 'stats' ? "text-emerald-600 scale-110" : "text-slate-300")}><TrendingUp size={20} /><span className="text-[10px] font-black uppercase tracking-widest">Stats</span></button>
+          <button onClick={() => setView('history')} className={cn("p-2 flex flex-col items-center gap-1 transition-all", view === 'history' ? "text-emerald-600 scale-110" : "text-slate-300")}><History size={20} /><span className="text-[10px] font-black uppercase tracking-widest">History</span></button>
+          <button onClick={() => setView('settings')} className={cn("p-2 flex flex-col items-center gap-1 transition-all", view === 'settings' ? "text-emerald-600 scale-110" : "text-slate-300")}><SettingsIcon size={20} /><span className="text-[10px] font-black uppercase tracking-widest">Settings</span></button>
         </div>
       )}
     </div>
